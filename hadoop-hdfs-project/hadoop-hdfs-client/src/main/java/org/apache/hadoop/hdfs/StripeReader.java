@@ -199,11 +199,13 @@ abstract class StripeReader {
 
   void readParityChunks(int num) throws IOException {
     for (int i = dataBlkNum, j = 0; i < dataBlkNum + parityBlkNum && j < num;
-         i++) {
+         i++){
+      DFSClient.LOG.debug("Fetch parity block: "+i);
       if (alignedStripe.chunks[i] == null) {
         if (prepareParityChunk(i) && readChunk(targetBlocks[i], i)) {
           j++;
         } else {
+
           alignedStripe.missingChunksNum++;
         }
       }
@@ -254,7 +256,7 @@ abstract class StripeReader {
       corruptedBlocks.addCorruptedBlock(currentBlock, currentNode);
       throw ce;
     } catch (IOException e) {
-      DFSClient.LOG.warn("Exception while reading from "
+      DFSClient.LOG.debug("Exception while reading from "
           + currentBlock + " of " + dfsStripedInputStream.getSrc() + " from "
           + currentNode, e);
       //Clear buffer to make next decode success
@@ -328,6 +330,32 @@ abstract class StripeReader {
    * read the whole stripe. do decoding if necessary
    */
   void readStripe() throws IOException {
+    /*
+     Added logic to retry and fetch a chunk.  @readStripe can fall victim to datanode idle connection
+     timeouts.  This can be a problem for key values stores that merge and read from sorted files.
+     Example: Two files, File A and File B.  Both Files are sorted and all the data in File A comes
+     before all the data in File B.  To merge these files in sorted order we need to read everything
+     from File A and write it out then read everything from FIle B and write it out. When these files are
+     opened at the same time, if it takes longer than dfs.datanode.socket.write.timeout between reads from
+     File B in our example, then the datanode will close the idle socket. Next stripe read from that socket
+     will throw an IOException. We will try and perform an erasure.  However since it is very likely that when
+     we exceeded dfs.datanode.socket.write.timeout for one chunk in the stripe we will have exceeded it for more
+     than #parity blocks chunks in the stripe.  This will cause the erasure to fail with not enough valid blocks.
+
+     This changes adds retry logic such that readStripe will allow and recover from a failure for each
+     chunk in a stripe. When the IOException is thrown in readToBuffer
+
+     parity blocks get thrown onto the same executor as data blocks. This retry will also attempt to retrieve
+     a parity block if needed.
+     */
+
+    /**
+     * cover re-read attempt for data + parity blocks
+     */
+    boolean retry[] = new boolean[dataBlkNum+parityBlkNum];
+    boolean processParity = true;
+    Arrays.fill(retry, true);
+
     for (int i = 0; i < dataBlkNum; i++) {
       if (alignedStripe.chunks[i] != null &&
           alignedStripe.chunks[i].state != StripingChunk.ALLZERO) {
@@ -350,36 +378,104 @@ abstract class StripeReader {
     // first read failure
     while (!futures.isEmpty()) {
       try {
+        processParity = true;
         StripingChunkReadResult r = StripedBlockUtil
             .getNextCompletedStripedRead(service, futures, 0);
         dfsStripedInputStream.updateReadStats(r.getReadStats());
         if (DFSClient.LOG.isDebugEnabled()) {
           DFSClient.LOG.debug("Read task returned: " + r + ", for stripe "
-              + alignedStripe);
+              + alignedStripe.chunks[r.index]);
         }
         StripingChunk returnedChunk = alignedStripe.chunks[r.index];
         Preconditions.checkNotNull(returnedChunk);
         Preconditions.checkState(returnedChunk.state == StripingChunk.PENDING);
 
         if (r.state == StripingChunkReadResult.SUCCESSFUL) {
+          DFSClient.LOG.debug("readstripe success r.index: "+r.index);
           returnedChunk.state = StripingChunk.FETCHED;
           alignedStripe.fetchedChunksNum++;
           updateState4SuccessRead(r);
           if (alignedStripe.fetchedChunksNum == dataBlkNum) {
+            DFSClient.LOG.debug("readstripe success chunks=datablcks");
             clearFutures();
             break;
           }
         } else {
-          returnedChunk.state = StripingChunk.MISSING;
-          // close the corresponding reader
-          dfsStripedInputStream.closeReader(readerInfos[r.index]);
+          /*
+           * We have StripingChunkReadResult that is not successful.  Either failed|cancelled|timeout.
+           * The case we want to handle is when there is an IOE timeout from @readBuffer called through
+           * @readCell. When we retrieve the future, an IOE exception will have been thrown which will be
+           * wrapped as an ExecutionException in @getNextCompletedStripedRead and return
+           *  a StripingChunkReadResult element with state StripingChunkReadResult.FAILED.
+           *
+           * We do not try and recover from an erasure timeout here because the index in @StripingChunkReadResult
+           * could be negative.  While we may want to adjust this in the future, here we are primarily
+           * concerned with idle connections closures during long pauses between reads.
+           * t
+           */
 
-          final int missing = alignedStripe.missingChunksNum;
-          alignedStripe.missingChunksNum++;
-          checkMissingBlocks();
+          if(r.state == StripingChunkReadResult.FAILED && retry[r.index]) {
+            retry[r.index] = false;
 
-          readDataForDecoding();
-          readParityChunks(alignedStripe.missingChunksNum - missing);
+            /*
+             * If we time out because of a datanode write timeout it is likely most of the
+             * chunks timed out.  Reopen block reads and put back on the executor
+             */
+            DFSClient.LOG.debug("readstripe requeue datablcks r.index: " + r.index+" state: "+r.state);
+
+            //Close client reader, socket was already closed by remote datanode
+            dfsStripedInputStream.closeReader(readerInfos[r.index]);
+
+            /*
+             In the begining of @readChunk two conditions are checked before alignedStripe.chunks[r.index] != null and
+              alignedStripe.chunks[i].state != StripingChunk.ALLZERO.  If these conditions don't hold the chunk will not be put on
+              executor so this index should never be seen in this check.  However, they are included as a safety check in case
+              future changes are made.
+             */
+
+            if (alignedStripe.chunks[r.index] != null && alignedStripe.chunks[r.index].state != StripingChunk.ALLZERO) {
+
+              DFSClient.LOG.debug("readstripe cleared if requeue datablcks r.index: " + r.index+" state: "+r.state);
+
+              readerInfos[r.index] = null;
+              if(readChunk(targetBlocks[r.index], r.index)){
+                /*
+                  There are three cases where this call can return false.
+                  (1) if LocatedBlock is null
+                  (2) if the blockreader create fails
+                  (3) if readerInfo is marked as shouldSkip
+                    If any of these states were true on entrance into this function they would not have
+                    been added to the executor in @readChunk so the index for that chunk
+                    should not appear here.
+                 */
+                processParity = false;
+
+               }
+
+              }
+            //}
+          }
+          if(processParity) {
+            returnedChunk.state = StripingChunk.MISSING;
+            DFSClient.LOG.debug("readstripe missing chunks < datablcks r.index pulling parity block: " + r.index);
+            // close the corresponding reader
+            dfsStripedInputStream.closeReader(readerInfos[r.index]);
+
+            final int missing = alignedStripe.missingChunksNum;
+            alignedStripe.missingChunksNum++;
+
+            //If num missing > num parity fail
+            checkMissingBlocks();
+
+            /**
+             * parity fetching time
+             *  verify request sent for each block
+             * @readParityChunks will only add num chunks = num
+             * missing blocks
+             */
+            readDataForDecoding();
+            readParityChunks(alignedStripe.missingChunksNum - missing);
+          }
         }
       } catch (InterruptedException ie) {
         String err = "Read request interrupted";
@@ -391,6 +487,7 @@ abstract class StripeReader {
     }
 
     if (alignedStripe.missingChunksNum > 0) {
+      DFSClient.LOG.debug("readstripe attempt decode");
       decode();
     }
   }

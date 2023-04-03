@@ -305,6 +305,14 @@ public class StripedBlockUtil {
         return new StripingChunkReadResult(StripingChunkReadResult.TIMEOUT);
       }
     } catch (ExecutionException e) {
+      /*
+        TODO: we want to change the error message going back so we know this was a timeout vs some other failure
+        datanode closing an idle connection because of long delay in read requests will cause  an IOException
+        from @StripeReader.readToBuffer. That happens within the context of a future and will be passed up wrapped
+        in an ExecutionException.  Currently the retry logic does not differentiate transitory issues, IOE from timeout
+        or a more serious error.  At current we will retry regardless.
+        Naively we could parse e and check if there's and IOE (java.io.IOException) that preceded the EE.
+       */
       LOG.debug("Exception during striped read task", e);
       return new StripingChunkReadResult(futures.remove(future),
           StripingChunkReadResult.FAILED);
