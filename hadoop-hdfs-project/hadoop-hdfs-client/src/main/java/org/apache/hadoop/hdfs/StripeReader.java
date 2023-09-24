@@ -343,7 +343,7 @@ abstract class StripeReader {
      than #parity blocks chunks in the stripe.  This will cause the erasure to fail with not enough valid blocks.
 
      This changes adds retry logic such that readStripe will allow and recover from a failure for each
-     chunk in a stripe. When the IOException is thrown in readToBuffer
+     chunk in a stripe.  Since a stripe is read at a time When the IOException is thrown in readToBuffer
 
      parity blocks get thrown onto the same executor as data blocks. This retry will also attempt to retrieve
      a parity block if needed.
