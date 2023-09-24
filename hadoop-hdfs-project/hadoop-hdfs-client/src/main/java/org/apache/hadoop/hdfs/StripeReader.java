@@ -331,11 +331,11 @@ abstract class StripeReader {
    */
   void readStripe() throws IOException {
     /*
-     Added logic to retry and fetch a chunk.  @readStripe can fall victim to datanode idle connection
-     timeouts.  This can be a problem for key values stores that merge and read from sorted files.
+     Added logic to retry fetching a chunk.  @readStripe can fall victim to datanode idle connection
+     timeouts.  This can be a problem for key values stores that merge sorted files.
      Example: Two files, File A and File B.  Both Files are sorted and all the data in File A comes
      before all the data in File B.  To merge these files in sorted order we need to read everything
-     from File A and write it out then read everything from FIle B and write it out. When these files are
+     from File A and write it out then read everything from FIle B and write it out. When the files are
      opened at the same time, if it takes longer than dfs.datanode.socket.write.timeout between reads from
      File B in our example, then the datanode will close the idle socket. Next stripe read from that socket
      will throw an IOException. We will try and perform an erasure.  However since it is very likely that when
@@ -343,9 +343,9 @@ abstract class StripeReader {
      than #parity blocks chunks in the stripe.  This will cause the erasure to fail with not enough valid blocks.
 
      This changes adds retry logic such that readStripe will allow and recover from a failure for each
-     chunk in a stripe.  Since a stripe is read at a time When the IOException is thrown in readToBuffer
-
-     parity blocks get thrown onto the same executor as data blocks. This retry will also attempt to retrieve
+     chunk in a stripe.  The attempt is made to read all chunks from a stripe in one pass,
+     if the executor can not support this then each chunk is read sequentially.
+     Parity blocks get thrown onto the same executor as data blocks. This retry will also attempt to retrieve
      a parity block if needed.
      */
 
@@ -391,6 +391,9 @@ abstract class StripeReader {
         Preconditions.checkState(returnedChunk.state == StripingChunk.PENDING);
 
         if (r.state == StripingChunkReadResult.SUCCESSFUL) {
+          //reset retry if there was a successful read of chunk
+          retry[r.index] = true;
+
           DFSClient.LOG.debug("readstripe success r.index: "+r.index);
           returnedChunk.state = StripingChunk.FETCHED;
           alignedStripe.fetchedChunksNum++;
